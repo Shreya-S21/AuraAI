@@ -1,3 +1,4 @@
+
 import { useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { SessionProvider } from "./context/SessionContext";
@@ -18,16 +19,9 @@ export default function App() {
   );
 }
 
-// Auth gate: render the sign-in screen until a user (or guest) exists.
 function Gate() {
   const { user } = useAuth();
-  if (!user) {
-    return (
-      <div className="min-h-screen bg-[#07070b] text-white">
-        <AuthScreen />
-      </div>
-    );
-  }
+  if (!user) return <AuthScreen />;
   return (
     <SessionProvider>
       <Shell />
@@ -41,7 +35,6 @@ function Shell() {
 
   return (
     <div className="min-h-screen bg-[#07070b] text-white">
-      {/* Ambient background */}
       <div className="pointer-events-none fixed inset-0 overflow-hidden">
         <div className="absolute left-1/4 top-0 h-[40rem] w-[40rem] -translate-x-1/2 rounded-full bg-violet-700/10 blur-[120px]" />
         <div className="absolute bottom-0 right-0 h-[34rem] w-[34rem] rounded-full bg-sky-700/10 blur-[120px]" />
@@ -66,8 +59,7 @@ function Shell() {
 
         <footer className="border-t border-white/5 px-4 py-8 text-center md:px-8">
           <p className="text-xs text-zinc-600">
-            AuraAI · Behavioral Recommendation Intelligence · CLIP + FAISS ·
-            Privacy-first · Built with Next.js, FastAPI, MediaPipe & PostgreSQL
+            AuraAI • Behavioral Recommendation Intelligence • Built with React, Vite, MediaPipe & Firebase
           </p>
         </footer>
       </div>
