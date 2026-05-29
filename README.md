@@ -26,3 +26,4 @@
 npm install
 cp .env.example .env
 npm run dev
+[![Netlify Status](https://api.netlify.com/api/v1/badges/d3f2ca80-1188-480d-bec5-f80d54db79c6/deploy-status)](https://app.netlify.com/projects/radiant-valkyrie-a20618/deploys)
