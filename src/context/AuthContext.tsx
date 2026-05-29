@@ -1,15 +1,5 @@
-// =============================================================
-// AuthContext — Firebase-first authentication with local fallback.
-// -------------------------------------------------------------
-// • If Firebase is configured (.env keys present) → REAL Firebase auth
-//   for Google, GitHub, AND email/password.
-// • If not configured → falls back to the local validated store so the
-//   app always runs (great for offline / quick demos).
-// =============================================================
-
 import {
-  createContext, useContext, useEffect, useState, useCallback, useMemo,
-  type ReactNode,
+  createContext, useContext, useState, useCallback, useMemo, type ReactNode,
 } from "react";
 import {
   registerAccount, verifyAccount, upsertProviderAccount,
@@ -73,12 +63,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     try {
       if (u) localStorage.setItem(SESSION_KEY, JSON.stringify(u));
       else localStorage.removeItem(SESSION_KEY);
-    } catch {
-      /* ignore */
-    }
+    } catch {}
   }, []);
 
-  // --- Email / password ---
   const signIn = useCallback(async (email: string, password: string) => {
     if (FIREBASE_READY) {
       persist(fromFirebase(await fbSignIn(email, password)));
@@ -95,10 +82,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, [persist]);
 
-  // --- Google / GitHub ---
   const signInWithProvider = useCallback(async (provider: "google" | "github") => {
     if (FIREBASE_READY) {
-      persist(fromFirebase(await fbProviderSignIn(provider))); // real OAuth popup
+      persist(fromFirebase(await fbProviderSignIn(provider)));
     } else {
       const email = `you@${provider === "google" ? "gmail.com" : "github.io"}`;
       const acc = upsertProviderAccount(
@@ -118,14 +104,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     if (FIREBASE_READY) void fbSignOut();
     persist(null);
   }, [persist]);
-
-  // Keep a console hint so you know which backend is live.
-  useEffect(() => {
-    console.info(
-      `[AuraAI] Auth backend: ${backend}` +
-      (backend === "local" ? " (add Firebase keys to .env for real OAuth)" : ""),
-    );
-  }, [backend]);
 
   const value = useMemo(
     () => ({ user, backend, signIn, signUp, signInWithProvider, continueAsGuest, signOut }),
