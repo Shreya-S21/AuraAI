@@ -1,0 +1,30 @@
+# ===== AuraAI FastAPI Backend Dependencies =====
+fastapi==0.110.0
+uvicorn[standard]==0.29.0
+pydantic==2.6.4
+pydantic-settings==2.2.1
+python-dotenv==1.0.1
+
+# Database (async PostgreSQL)
+sqlalchemy[asyncio]==2.0.29
+asyncpg==0.29.0
+alembic==1.13.1
+
+# AI / CV stack
+numpy==1.26.4
+opencv-python-headless==4.9.0.80
+mediapipe==0.10.11
+deepface==0.0.91
+torch==2.2.2
+# Use the PyPI CLIP package instead of a git URL (no `git` binary needed,
+# works in Docker slim images and on Windows).
+open-clip-torch==2.24.0
+faiss-cpu==1.8.0
+pillow==10.3.0
+
+# Auth (Clerk / Auth0 JWT verification)
+python-jose[cryptography]==3.3.0
+httpx==0.27.0
+
+# Utils
+loguru==0.7.2
