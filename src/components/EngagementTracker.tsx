@@ -9,14 +9,13 @@
 // processed entirely on-device; only numeric signals are kept.
 // =============================================================
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Camera, CameraOff, Activity, ScanFace, Shield, Eye, Loader2 } from "lucide-react";
 import { Button, Card } from "./ui";
 import { useSession } from "../context/SessionContext";
 import { ProductImage } from "./ProductImage";
-import { PRODUCTS, type Product } from "../data/products";
-import { recommend, type EngagementState } from "../lib/engagement";
+import { findVisibleGazeTarget, gazeToViewportPoint, quickLookReview, type GazeTarget } from "../lib/gazeTargeting";
 import {
   loadFaceLandmarker,
   analyzeFrame,
@@ -25,7 +24,7 @@ import {
 } from "../lib/faceMesh";
 
 export function EngagementTracker() {
-  const { state, cameraActive, setCameraActive, attention, setAttention } = useSession();
+  const { cameraActive, setCameraActive, attention, setAttention } = useSession();
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const rafRef = useRef<number>(0);
@@ -34,6 +33,7 @@ export function EngagementTracker() {
   const [error, setError] = useState<string | null>(null);
   const [loadingModel, setLoadingModel] = useState(false);
   const [sig, setSig] = useState<FaceSignals | null>(null);
+  const [gazeTarget, setGazeTarget] = useState<GazeTarget | null>(null);
 
   const stop = useCallback(() => {
     cancelAnimationFrame(rafRef.current);
@@ -42,6 +42,7 @@ export function EngagementTracker() {
     setCameraActive(false);
     setAttention(0);
     setSig(null);
+    setGazeTarget(null);
     attentionSmooth.current = 0;
   }, [setCameraActive, setAttention]);
 
@@ -53,6 +54,7 @@ export function EngagementTracker() {
     }
     const s = analyzeFrame(video, performance.now());
     setSig(s);
+    setGazeTarget(findVisibleGazeTarget(s));
     // Smooth published attention (EMA) so scoring isn't jittery.
     attentionSmooth.current = +(attentionSmooth.current * 0.82 + s.attention * 0.18).toFixed(3);
     setAttention(attentionSmooth.current);
@@ -99,10 +101,8 @@ export function EngagementTracker() {
   const attPct = Math.round(attention * 100);
   const present = !!sig?.present;
   const box = sig?.box ?? null;
-  const gazeCandidates = useMemo(() => {
-    return buildGazeCandidates(state);
-  }, [state]);
-  const lookedProduct = present && sig ? pickLookTarget(sig, gazeCandidates) : null;
+  const lookedProduct = gazeTarget?.product ?? null;
+  const gazePoint = sig?.present ? gazeToViewportPoint(sig) : null;
   const popupPlacement = box ? facePopupPlacement(box) : null;
 
   return (
@@ -182,7 +182,16 @@ export function EngagementTracker() {
                   </span>
                 </motion.div>
               )}
-              {present && box && lookedProduct && popupPlacement && (
+              {present && box && gazePoint && (
+                <motion.div
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  exit={{ opacity: 0 }}
+                  className="pointer-events-none fixed z-[70] h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full border border-sky-300 bg-sky-400/80 shadow-lg shadow-sky-400/40"
+                  style={{ left: gazePoint.x, top: gazePoint.y }}
+                />
+              )}
+              {present && box && lookedProduct && popupPlacement && gazeTarget && (
                 <motion.div
                   key={lookedProduct.id}
                   initial={{ opacity: 0, y: 8, scale: 0.95 }}
@@ -195,10 +204,13 @@ export function EngagementTracker() {
                   <ProductImage product={lookedProduct} className="h-16 w-full" />
                   <div className="p-2">
                     <p className="text-[9px] uppercase tracking-wide text-violet-300">
-                      {sig?.lookingAtScreen ? "Likely viewing" : "Gaze nearby"}
+                      {gazeTarget.confidence > 85 ? "Screen target" : "Nearest card"} · {gazeTarget.confidence}%
                     </p>
                     <p className="truncate text-[11px] font-semibold text-white">
                       {lookedProduct.name}
+                    </p>
+                    <p className="mt-1 line-clamp-2 text-[10px] leading-snug text-zinc-400">
+                      {quickLookReview(gazeTarget)}
                     </p>
                   </div>
                 </motion.div>
@@ -260,44 +272,6 @@ function gazeLabel(s: FaceSignals): string {
   const h = s.gazeX > 0.25 ? "Right" : s.gazeX < -0.25 ? "Left" : "";
   const v = s.gazeY > 0.3 ? "Down" : s.gazeY < -0.3 ? "Up" : "";
   return [v, h].filter(Boolean).join("-") || "Center";
-}
-
-function buildGazeCandidates(state: EngagementState): Product[] {
-  const seen = new Set<string>();
-  const out: Product[] = [];
-  const add = (p: Product | undefined) => {
-    if (!p || seen.has(p.id)) return;
-    seen.add(p.id);
-    out.push(p);
-  };
-
-  // 1) Personalized recommendations first.
-  recommend(state, 8).forEach((r) => add(r.product));
-
-  // 2) Add saved and viewed products so the camera popup reflects the user's session.
-  PRODUCTS.filter((p) => state.liked[p.id]).forEach(add);
-  PRODUCTS
-    .filter((p) => (state.signals[p.id]?.views ?? 0) > 0)
-    .sort((a, b) => (state.signals[b.id]?.dwellMs ?? 0) - (state.signals[a.id]?.dwellMs ?? 0))
-    .forEach(add);
-
-  // 3) Fill with diverse category representatives, not just the first catalog items.
-  for (const p of PRODUCTS) {
-    if (!out.some((x) => x.category === p.category)) add(p);
-  }
-  PRODUCTS.forEach(add);
-
-  return out.slice(0, 9);
-}
-
-function pickLookTarget<T>(s: FaceSignals, products: T[]): T | null {
-  if (!products.length) return null;
-  // Map measured gaze into a 3x3 attention grid so different gaze zones
-  // resolve to different products. Deterministic, not randomized.
-  const xBin = s.gazeX < -0.18 ? 0 : s.gazeX > 0.18 ? 2 : 1;
-  const yBin = s.gazeY < -0.22 ? 0 : s.gazeY > 0.22 ? 2 : 1;
-  const index = yBin * 3 + xBin;
-  return products[index % products.length];
 }
 
 function facePopupPlacement(box: { x: number; y: number; w: number; h: number }) {
