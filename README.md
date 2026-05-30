@@ -12,6 +12,7 @@
 ## Live Demo
 
 [View AuraAI on Netlify](https://radiant-valkyrie-a20618.netlify.app)
+[View AuraAI on Vercel.](https://aura-ai-auraai67.vercel.app)
 
 ## Features
 
