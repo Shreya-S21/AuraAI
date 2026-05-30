@@ -20,7 +20,17 @@ export function gazeToViewportPoint(sig: FaceSignals) {
   //   2) Iris gaze alone only covers a narrow angular range. We blend in head
   //      yaw to let the projection reach the edges of the viewport when the
   //      user turns their head.
-  //   3) Output is clamped to stay inside the visible page.
+  //   3) The projection is RESTRICTED to the actual product grid region on
+  //      the page (computed from visible card DOM positions), NOT the full
+  //      viewport. This prevents the gaze dot from landing on the header,
+  //      tracker sidebar, or empty gaps.
+  const gridBounds = getProductGridBounds();
+  if (!gridBounds) {
+    // No products visible on screen right now — project into center as a safe
+    // default so the UI doesn't jitter.
+    return { x: window.innerWidth / 2, y: window.innerHeight / 2 };
+  }
+
   const gazeFlip = -sig.gazeX;
   const yawNorm = clamp(sig.yaw / 35, -1, 1);
 
@@ -32,13 +42,47 @@ export function gazeToViewportPoint(sig: FaceSignals) {
     1,
   );
 
-  // Spread over ~90% of the viewport so the dot actually crosses product cards.
-  const x = window.innerWidth * (0.5 + xFactor * 0.45);
-  const y = window.innerHeight * (0.5 + yFactor * 0.4);
+  // Map the [-1,1] factors into the actual product grid bounding box so the
+  // dot and nearest-card matching only consider real product positions.
+  const x = gridBounds.x + ((xFactor + 1) / 2) * gridBounds.width;
+  const y = gridBounds.y + ((yFactor + 1) / 2) * gridBounds.height;
   return {
-    x: clamp(x, 16, window.innerWidth - 16),
-    y: clamp(y, 16, window.innerHeight - 16),
+    x: clamp(x, gridBounds.x + 4, gridBounds.x + gridBounds.width - 4),
+    y: clamp(y, gridBounds.y + 4, gridBounds.y + gridBounds.height - 4),
   };
+}
+
+// Compute the bounding box that encloses all visible product card elements.
+// Returns null if nothing is visible on screen.
+export function getProductsVisible(): boolean {
+  return document.querySelectorAll<HTMLElement>("[data-aura-product-id]").length > 0;
+}
+
+interface Bounds { x: number; y: number; width: number; height: number }
+
+function getProductGridBounds(): Bounds | null {
+  const nodes = Array.from(
+    document.querySelectorAll<HTMLElement>("[data-aura-product-id]"),
+  );
+  if (nodes.length === 0) return null;
+
+  let minX = Number.MAX_VALUE;
+  let minY = Number.MAX_VALUE;
+  let maxX = Number.MIN_VALUE;
+  let maxY = Number.MIN_VALUE;
+  let anyVisible = false;
+
+  for (const node of nodes) {
+    const rect = node.getBoundingClientRect();
+    if (!isVisible(rect)) continue;
+    anyVisible = true;
+    minX = Math.min(minX, rect.left);
+    minY = Math.min(minY, rect.top);
+    maxX = Math.max(maxX, rect.right);
+    maxY = Math.max(maxY, rect.bottom);
+  }
+  if (!anyVisible) return null;
+  return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
 }
 
 export function findVisibleGazeTarget(sig: FaceSignals): GazeTarget | null {
@@ -56,26 +100,35 @@ export function findVisibleGazeTarget(sig: FaceSignals): GazeTarget | null {
     const rect = node.getBoundingClientRect();
     if (!isVisible(rect)) continue;
 
-    const dx = point.x < rect.left ? rect.left - point.x : point.x > rect.right ? point.x - rect.right : 0;
-    const dy = point.y < rect.top ? rect.top - point.y : point.y > rect.bottom ? point.y - rect.bottom : 0;
-    const distance = Math.hypot(dx, dy);
-    const inside = dx === 0 && dy === 0;
-    const confidence = inside ? 98 : Math.max(0, Math.round(92 - distance / 5));
+    // Only consider cards whose bounding box actually contains the projected
+    // gaze point. This prevents matching cards across empty gaps and makes the
+    // popup only appear when the gaze truly lands on a product card.
+    const inside =
+      point.x >= rect.left &&
+      point.x <= rect.right &&
+      point.y >= rect.top &&
+      point.y <= rect.bottom;
+    if (!inside) continue;
+
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+    const distance = Math.hypot(point.x - cx, point.y - cy);
+    const maxDistance = Math.hypot(rect.width / 2, rect.height / 2);
+    const confidence = Math.max(40, Math.round(100 - (distance / maxDistance) * 60));
     const candidate: GazeTarget = { product, rect, distance, confidence, point };
     if (!best || candidate.distance < best.distance) best = candidate;
   }
 
-  // Avoid confident-looking guesses when the projected point is far away from
-  // every product card. This keeps the overlay honest.
-  if (!best || best.distance > 260) return null;
+  // If no card actually contains the gaze point, show nothing. Don't force a
+  // match — this keeps the popup honest when the user is looking between cards.
   return best;
 }
 
 export function quickLookReview(target: GazeTarget): string {
   const { product, confidence } = target;
   if (confidence > 85) return `Your gaze is landing on ${product.name}.`;
-  if (confidence > 55) return `You appear to be scanning near ${product.name}.`;
-  return `Closest visible product is ${product.name}.`;
+  if (confidence > 60) return `You appear to be scanning ${product.name}.`;
+  return `Gaze is over ${product.name}.`;
 }
 
 function isVisible(rect: DOMRect) {
