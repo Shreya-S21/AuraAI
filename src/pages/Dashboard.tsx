@@ -160,6 +160,7 @@ export function Dashboard({ onOpen }: { onOpen: (p: Product) => void }) {
               <button
                 key={p.id}
                 onClick={() => onOpen(p)}
+                data-aura-product-id={p.id}
                 title={`${p.name} · ${sc}%`}
                 className="group relative aspect-square rounded-lg border border-white/5 transition hover:scale-105"
                 style={{
