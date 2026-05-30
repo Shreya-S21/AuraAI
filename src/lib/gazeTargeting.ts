@@ -11,143 +11,186 @@ export interface GazeTarget {
 
 const PRODUCT_BY_ID = new Map(PRODUCTS.map((p) => [p.id, p]));
 
-export function gazeToViewportPoint(sig: FaceSignals) {
-  // Calibration:
-  //   1) The video element is mirrored with CSS (-scale-x-100) so the user
-  //      sees themselves naturally, but MediaPipe gaze values are from the
-  //      *raw* (unmirrored) camera frame. We negate gazeX so left/right
-  //      matches what the user sees on screen.
-  //   2) Iris gaze alone only covers a narrow angular range. We blend in head
-  //      yaw to let the projection reach the edges of the viewport when the
-  //      user turns their head.
-  //   3) The projection is RESTRICTED to the actual product grid region on
-  //      the page (computed from visible card DOM positions), NOT the full
-  //      viewport. This prevents the gaze dot from landing on the header,
-  //      tracker sidebar, or empty gaps.
-  const gridBounds = getProductGridBounds();
-  if (!gridBounds) {
-    // No products visible on screen right now — project into center as a safe
-    // default so the UI doesn't jitter.
-    return { x: window.innerWidth / 2, y: window.innerHeight / 2 };
+// =====================================================================
+// CALIBRATION CONSTANTS — change these to dial in feel without rewriting.
+// =====================================================================
+const TUNE = {
+  // Sign per axis. Flip these if a direction is reversed for you.
+  signX: -1,        // -1 because the webcam preview is CSS-mirrored
+  signY: +1,
+  // Iris values inside this magnitude are treated as "looking center" so
+  // tiny involuntary saccades don't twitch the dot off-center.
+  deadZone: 0.06,
+  // How aggressively to map iris values to screen space. Lower = calmer.
+  gainX: 2.4,
+  gainY: 2.0,
+  // EMA smoothing. 0..1 — higher = smoother but laggier.
+  smooth: 0.82,
+  // Sticky target: once a product is selected, it stays selected unless
+  // the new candidate is meaningfully closer (in pixels). Stops flicker.
+  stickinessPx: 90,
+  // Maximum projected distance from a product card before we hide the popup.
+  maxLockPx: 220,
+  // How many consecutive frames a new candidate must win before we switch.
+  switchFrames: 5,
+};
+
+// ---------- Product grid bounding box ----------
+function productGridBounds(): { left: number; top: number; width: number; height: number } | null {
+  const nodes = Array.from(document.querySelectorAll<HTMLElement>("[data-aura-product-id]"));
+  let minL = Infinity, minT = Infinity, maxR = -Infinity, maxB = -Infinity;
+  let found = false;
+  for (const node of nodes) {
+    const r = node.getBoundingClientRect();
+    if (r.width < 24 || r.height < 24) continue;
+    if (r.bottom < 0 || r.top > window.innerHeight) continue;
+    if (r.right < 0 || r.left > window.innerWidth) continue;
+    found = true;
+    if (r.left < minL) minL = r.left;
+    if (r.top < minT) minT = r.top;
+    if (r.right > maxR) maxR = r.right;
+    if (r.bottom > maxB) maxB = r.bottom;
   }
+  if (!found) return null;
+  return { left: minL, top: minT, width: maxR - minL, height: maxB - minT };
+}
 
-  // The user wants to look right and have the dot go right, without moving
-  // their head. So we amplify the iris signal to cover the full viewport range.
-  //
-  // Comfortable eye movement (no head turn) gives iris values around ±0.3.
-  // We multiply by ~3x so that reaches ±0.9 (near the edges).
-  //
-  // Head pose (yaw/pitch) is used as a secondary fine-tuner, not the primary
-  // driver. This way the user can control the dot with their eyes alone.
-  const gazeFlip = -sig.gazeX;
-  const irisNorm = clamp(gazeFlip * 3, -1, 1);
-  const yawNorm = -clamp(sig.yaw / 40, -1, 1);
+// ---------- Signal smoothing ----------
+let smX = 0;
+let smY = 0;
 
-  // 80% iris + 20% head pose
-  const xFactor = clamp(irisNorm * 0.8 + yawNorm * 0.2, -1, 1);
+function deadband(v: number, dz: number) {
+  if (v > dz) return (v - dz) / (1 - dz);
+  if (v < -dz) return (v + dz) / (1 - dz);
+  return 0;
+}
 
-  // Same for vertical: amplify iris, keep pitch as fine-tuner
-  const irisYNorm = clamp(sig.gazeY * 3, -1, 1);
-  const pitchNorm = -clamp(sig.pitch / 30, -1, 1);
-  const yFactor = clamp(irisYNorm * 0.8 + pitchNorm * 0.2, -1, 1);
+function shape(v: number, gain: number) {
+  // Tanh keeps the response smooth and bounded. Moderate gain so we don't
+  // snap to the corner from any small eye motion.
+  return Math.tanh(v * gain);
+}
 
-  // Map the [-1,1] factors into the actual product grid bounding box so the
-  // dot and nearest-card matching only consider real product positions.
-  const x = gridBounds.x + ((xFactor + 1) / 2) * gridBounds.width;
-  const y = gridBounds.y + ((yFactor + 1) / 2) * gridBounds.height;
+// ---------- Gaze projection ----------
+export function gazeToViewportPoint(sig: FaceSignals) {
+  // Apply per-axis sign, then dead zone, then smoothing, then shape.
+  const rawX = TUNE.signX * sig.gazeX;
+  const rawY = TUNE.signY * sig.gazeY;
+
+  smX = smX * TUNE.smooth + rawX * (1 - TUNE.smooth);
+  smY = smY * TUNE.smooth + rawY * (1 - TUNE.smooth);
+
+  const xFactor = shape(deadband(smX, TUNE.deadZone), TUNE.gainX);
+  const yFactor = shape(deadband(smY, TUNE.deadZone), TUNE.gainY);
+
+  const grid = productGridBounds();
+  if (grid) {
+    const x = grid.left + grid.width * (0.5 + xFactor * 0.5);
+    const y = grid.top + grid.height * (0.5 + yFactor * 0.5);
+    return {
+      x: clamp(x, grid.left + 8, grid.left + grid.width - 8),
+      y: clamp(y, grid.top + 8, grid.top + grid.height - 8),
+    };
+  }
+  const x = window.innerWidth * (0.5 + xFactor * 0.48);
+  const y = window.innerHeight * (0.5 + yFactor * 0.45);
   return {
-    x: clamp(x, gridBounds.x + 4, gridBounds.x + gridBounds.width - 4),
-    y: clamp(y, gridBounds.y + 4, gridBounds.y + gridBounds.height - 4),
+    x: clamp(x, 16, window.innerWidth - 16),
+    y: clamp(y, 16, window.innerHeight - 16),
   };
 }
 
-// Compute the bounding box that encloses all visible product card elements.
-// Returns null if nothing is visible on screen.
-export function getProductsVisible(): boolean {
-  return document.querySelectorAll<HTMLElement>("[data-aura-product-id]").length > 0;
+export function resetGazeSmoothing() {
+  smX = 0;
+  smY = 0;
+  lockedId = null;
+  lockedDist = Infinity;
+  challenger = null;
+  challengerFrames = 0;
 }
 
-interface Bounds { x: number; y: number; width: number; height: number }
+// ---------- Target lock (anti-flicker) ----------
+let lockedId: string | null = null;
+let lockedDist = Infinity;
+let challenger: string | null = null;
+let challengerFrames = 0;
 
-function getProductGridBounds(): Bounds | null {
-  const nodes = Array.from(
-    document.querySelectorAll<HTMLElement>("[data-aura-product-id]"),
-  );
-  if (nodes.length === 0) return null;
-
-  let minX = Number.MAX_VALUE;
-  let minY = Number.MAX_VALUE;
-  let maxX = Number.MIN_VALUE;
-  let maxY = Number.MIN_VALUE;
-  let anyVisible = false;
-
-  for (const node of nodes) {
-    const rect = node.getBoundingClientRect();
-    if (!isVisible(rect)) continue;
-    anyVisible = true;
-    minX = Math.min(minX, rect.left);
-    minY = Math.min(minY, rect.top);
-    maxX = Math.max(maxX, rect.right);
-    maxY = Math.max(maxY, rect.bottom);
-  }
-  if (!anyVisible) return null;
-  return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
-}
+interface RawCandidate { id: string; product: Product; rect: DOMRect; distance: number; }
 
 export function findVisibleGazeTarget(sig: FaceSignals): GazeTarget | null {
-  if (!sig.present) return null;
+  if (!sig.present) {
+    challenger = null; challengerFrames = 0;
+    return null;
+  }
   const point = gazeToViewportPoint(sig);
-  const nodes = Array.from(
-    document.querySelectorAll<HTMLElement>("[data-aura-product-id]"),
-  );
 
-  let best: GazeTarget | null = null;
+  const nodes = Array.from(document.querySelectorAll<HTMLElement>("[data-aura-product-id]"));
+  const candidates: RawCandidate[] = [];
   for (const node of nodes) {
     const id = node.dataset.auraProductId;
     const product = id ? PRODUCT_BY_ID.get(id) : undefined;
-    if (!product) continue;
+    if (!id || !product) continue;
     const rect = node.getBoundingClientRect();
     if (!isVisible(rect)) continue;
-
-    // Only consider cards whose bounding box actually contains the projected
-    // gaze point. This prevents matching cards across empty gaps and makes the
-    // popup only appear when the gaze truly lands on a product card.
-    const inside =
-      point.x >= rect.left &&
-      point.x <= rect.right &&
-      point.y >= rect.top &&
-      point.y <= rect.bottom;
-    if (!inside) continue;
-
-    const cx = rect.left + rect.width / 2;
-    const cy = rect.top + rect.height / 2;
-    const distance = Math.hypot(point.x - cx, point.y - cy);
-    const maxDistance = Math.hypot(rect.width / 2, rect.height / 2);
-    const confidence = Math.max(40, Math.round(100 - (distance / maxDistance) * 60));
-    const candidate: GazeTarget = { product, rect, distance, confidence, point };
-    if (!best || candidate.distance < best.distance) best = candidate;
+    const dx = point.x < rect.left ? rect.left - point.x : point.x > rect.right ? point.x - rect.right : 0;
+    const dy = point.y < rect.top ? rect.top - point.y : point.y > rect.bottom ? point.y - rect.bottom : 0;
+    candidates.push({ id, product, rect, distance: Math.hypot(dx, dy) });
   }
 
-  // If no card actually contains the gaze point, show nothing. Don't force a
-  // match — this keeps the popup honest when the user is looking between cards.
-  return best;
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => a.distance - b.distance);
+  const closest = candidates[0];
+
+  // First-time lock
+  if (lockedId === null) {
+    lockedId = closest.id;
+    lockedDist = closest.distance;
+  } else {
+    // Update distance to currently-locked product
+    const lockedNow = candidates.find((c) => c.id === lockedId);
+    lockedDist = lockedNow ? lockedNow.distance : Infinity;
+
+    // Consider switching only if a different product is meaningfully closer
+    if (closest.id !== lockedId && lockedDist - closest.distance > TUNE.stickinessPx) {
+      if (challenger === closest.id) {
+        challengerFrames += 1;
+      } else {
+        challenger = closest.id;
+        challengerFrames = 1;
+      }
+      if (challengerFrames >= TUNE.switchFrames) {
+        lockedId = closest.id;
+        lockedDist = closest.distance;
+        challenger = null;
+        challengerFrames = 0;
+      }
+    } else {
+      challenger = null;
+      challengerFrames = 0;
+    }
+  }
+
+  if (lockedDist > TUNE.maxLockPx) return null;
+
+  const final = candidates.find((c) => c.id === lockedId) ?? closest;
+  const inside = final.distance === 0;
+  const confidence = inside ? 96 : Math.max(0, Math.round(92 - final.distance / 4.5));
+  return { product: final.product, rect: final.rect, distance: final.distance, confidence, point };
 }
 
 export function quickLookReview(target: GazeTarget): string {
   const { product, confidence } = target;
   if (confidence > 85) return `Your gaze is landing on ${product.name}.`;
-  if (confidence > 60) return `You appear to be scanning ${product.name}.`;
-  return `Gaze is over ${product.name}.`;
+  if (confidence > 55) return `You appear to be scanning near ${product.name}.`;
+  return `Closest visible product is ${product.name}.`;
 }
 
+// ---------- helpers ----------
 function isVisible(rect: DOMRect) {
   return (
-    rect.width > 24 &&
-    rect.height > 24 &&
-    rect.bottom > 0 &&
-    rect.right > 0 &&
-    rect.top < window.innerHeight &&
-    rect.left < window.innerWidth
+    rect.width > 24 && rect.height > 24 &&
+    rect.bottom > 0 && rect.right > 0 &&
+    rect.top < window.innerHeight && rect.left < window.innerWidth
   );
 }
 
