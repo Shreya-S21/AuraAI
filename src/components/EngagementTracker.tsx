@@ -11,11 +11,14 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Camera, CameraOff, Activity, ScanFace, Shield, Eye, Loader2 } from "lucide-react";
+import { Camera, CameraOff, Activity, ScanFace, Shield, Eye, Loader2, Target } from "lucide-react";
 import { Button, Card } from "./ui";
 import { useSession } from "../context/SessionContext";
 import { ProductImage } from "./ProductImage";
 import { findVisibleGazeTarget, gazeToViewportPoint, quickLookReview, type GazeTarget } from "../lib/gazeTargeting";
+import { writeLiveGaze } from "../lib/liveGaze";
+import { loadCalibration } from "../lib/calibration";
+import { CalibrationOverlay } from "./CalibrationOverlay";
 import {
   loadFaceLandmarker,
   analyzeFrame,
@@ -34,6 +37,8 @@ export function EngagementTracker() {
   const [loadingModel, setLoadingModel] = useState(false);
   const [sig, setSig] = useState<FaceSignals | null>(null);
   const [gazeTarget, setGazeTarget] = useState<GazeTarget | null>(null);
+  const [calibrating, setCalibrating] = useState(false);
+  const hasCalibration = !!loadCalibration();
 
   const stop = useCallback(() => {
     cancelAnimationFrame(rafRef.current);
@@ -58,6 +63,13 @@ export function EngagementTracker() {
     // Smooth published attention (EMA) so scoring isn't jittery.
     attentionSmooth.current = +(attentionSmooth.current * 0.82 + s.attention * 0.18).toFixed(3);
     setAttention(attentionSmooth.current);
+    // Publish raw gaze to shared store so CalibrationOverlay can sample it.
+    writeLiveGaze({
+      gazeX: s.gazeX,
+      gazeY: s.gazeY,
+      present: s.present,
+      attention: s.attention,
+    });
     rafRef.current = requestAnimationFrame(loop);
   }, [setAttention]);
 
@@ -106,7 +118,8 @@ export function EngagementTracker() {
   const popupPlacement = box ? facePopupPlacement(box) : null;
 
   return (
-    <Card className="overflow-hidden">
+    <>
+      <Card className="overflow-hidden">
       <div className="flex items-center justify-between border-b border-white/5 p-4">
         <div className="flex items-center gap-2">
           <ScanFace className="h-5 w-5 text-violet-400" />
@@ -204,7 +217,7 @@ export function EngagementTracker() {
                   <ProductImage product={lookedProduct} className="h-16 w-full" />
                   <div className="p-2">
                     <p className="text-[9px] uppercase tracking-wide text-violet-300">
-                      Gaze target · {gazeTarget.confidence}%
+                      {gazeTarget.confidence > 85 ? "Screen target" : "Nearest card"} · {gazeTarget.confidence}%
                     </p>
                     <p className="truncate text-[11px] font-semibold text-white">
                       {lookedProduct.name}
@@ -256,14 +269,35 @@ export function EngagementTracker() {
           <span className="flex items-center gap-1 text-[10px] text-zinc-500">
             <Shield className="h-3 w-3" /> On-device · no emotion data · no frames stored
           </span>
-          {cameraActive && (
-            <Button variant="ghost" className="px-2 py-1 text-xs" onClick={stop}>
-              <CameraOff className="h-3.5 w-3.5" /> Stop
-            </Button>
-          )}
+          <div className="flex items-center gap-1">
+            {cameraActive && (
+              <>
+                <Button
+                  variant="ghost"
+                  className="px-2 py-1 text-xs"
+                  onClick={() => setCalibrating(true)}
+                  title={hasCalibration ? "Recalibrate gaze" : "Calibrate gaze for better accuracy"}
+                >
+                  <Target className="h-3.5 w-3.5" />
+                  <span className="ml-1 hidden sm:inline">{hasCalibration ? "Recalibrate" : "Calibrate"}</span>
+                </Button>
+                <Button variant="ghost" className="px-2 py-1 text-xs" onClick={stop}>
+                  <CameraOff className="h-3.5 w-3.5" /> Stop
+                </Button>
+              </>
+            )}
+          </div>
         </div>
       </div>
     </Card>
+
+    {calibrating && (
+      <CalibrationOverlay
+        onDone={() => setCalibrating(false)}
+        onCancel={() => setCalibrating(false)}
+      />
+    )}
+  </>
   );
 }
 
