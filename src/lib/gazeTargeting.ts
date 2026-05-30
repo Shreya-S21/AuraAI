@@ -12,12 +12,33 @@ export interface GazeTarget {
 const PRODUCT_BY_ID = new Map(PRODUCTS.map((p) => [p.id, p]));
 
 export function gazeToViewportPoint(sig: FaceSignals) {
-  // This is a calibrated approximation: MediaPipe gives eye direction, then
-  // we project it onto the current viewport. It is deterministic and uses the
-  // actual screen positions of product cards, not a random product list.
-  const x = window.innerWidth * clamp(0.5 + sig.gazeX * 0.42, 0.04, 0.96);
-  const y = window.innerHeight * clamp(0.5 + sig.gazeY * 0.38, 0.08, 0.92);
-  return { x, y };
+  // Calibration:
+  //   1) The video element is mirrored with CSS (-scale-x-100) so the user
+  //      sees themselves naturally, but MediaPipe gaze values are from the
+  //      *raw* (unmirrored) camera frame. We negate gazeX so left/right
+  //      matches what the user sees on screen.
+  //   2) Iris gaze alone only covers a narrow angular range. We blend in head
+  //      yaw to let the projection reach the edges of the viewport when the
+  //      user turns their head.
+  //   3) Output is clamped to stay inside the visible page.
+  const gazeFlip = -sig.gazeX;
+  const yawNorm = clamp(sig.yaw / 35, -1, 1);
+
+  // 55% iris + 45% head pose. Iris gives precision, head gives range.
+  const xFactor = clamp(gazeFlip * 0.55 + yawNorm * 0.45, -1, 1);
+  const yFactor = clamp(
+    sig.gazeY * 0.7 + clamp(sig.pitch / 25, -1, 1) * 0.3,
+    -1,
+    1,
+  );
+
+  // Spread over ~90% of the viewport so the dot actually crosses product cards.
+  const x = window.innerWidth * (0.5 + xFactor * 0.45);
+  const y = window.innerHeight * (0.5 + yFactor * 0.4);
+  return {
+    x: clamp(x, 16, window.innerWidth - 16),
+    y: clamp(y, 16, window.innerHeight - 16),
+  };
 }
 
 export function findVisibleGazeTarget(sig: FaceSignals): GazeTarget | null {
