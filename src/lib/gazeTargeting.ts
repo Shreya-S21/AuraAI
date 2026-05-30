@@ -1,5 +1,6 @@
 import { PRODUCTS, type Product } from "../data/products";
 import type { FaceSignals } from "./faceMesh";
+import { loadCalibration, calibrationBounds, calibratedFactor } from "./calibration";
 
 export interface GazeTarget {
   product: Product;
@@ -18,12 +19,14 @@ const TUNE = {
   // Sign per axis. Flip these if a direction is reversed for you.
   signX: -1,        // -1 because the webcam preview is CSS-mirrored
   signY: +1,
-  // Iris values inside this magnitude are treated as "looking center" so
-  // tiny involuntary saccades don't twitch the dot off-center.
-  deadZone: 0.06,
-  // How aggressively to map iris values to screen space. Lower = calmer.
-  gainX: 2.4,
-  gainY: 2.0,
+  // Iris values below this magnitude are zeroed (treated as center gaze).
+  // Kept small so comfortable eye motion is preserved.
+  deadZone: 0.04,
+  // How aggressively to map iris values to screen space. Higher = reaches
+  // edges with smaller eye movement. Increase these two if you still have
+  // to look at the computer's edges to reach side products.
+  gainX: 4.2,
+  gainY: 3.8,
   // EMA smoothing. 0..1 — higher = smoother but laggier.
   smooth: 0.82,
   // Sticky target: once a product is selected, it stays selected unless
@@ -60,9 +63,11 @@ let smX = 0;
 let smY = 0;
 
 function deadband(v: number, dz: number) {
-  if (v > dz) return (v - dz) / (1 - dz);
-  if (v < -dz) return (v + dz) / (1 - dz);
-  return 0;
+  // Simple threshold — zero out tiny values but don't rescale. Rescaling
+  // shrinks the usable iris range, which is exactly why the dot couldn't
+  // reach the edges.
+  if (Math.abs(v) < dz) return 0;
+  return v;
 }
 
 function shape(v: number, gain: number) {
@@ -73,16 +78,30 @@ function shape(v: number, gain: number) {
 
 // ---------- Gaze projection ----------
 export function gazeToViewportPoint(sig: FaceSignals) {
-  // Apply per-axis sign, then dead zone, then smoothing, then shape.
+  // Apply per-axis sign (webcam is CSS-mirrored, so negate X).
   const rawX = TUNE.signX * sig.gazeX;
   const rawY = TUNE.signY * sig.gazeY;
 
+  // EMA smoothing to reduce jitter.
   smX = smX * TUNE.smooth + rawX * (1 - TUNE.smooth);
   smY = smY * TUNE.smooth + rawY * (1 - TUNE.smooth);
 
-  const xFactor = shape(deadband(smX, TUNE.deadZone), TUNE.gainX);
-  const yFactor = shape(deadband(smY, TUNE.deadZone), TUNE.gainY);
+  let xFactor: number;
+  let yFactor: number;
 
+  const cal = loadCalibration();
+  if (cal) {
+    // Calibrated path: use per-user iris bounds learned from 9-point setup.
+    const bounds = calibrationBounds(cal);
+    xFactor = calibratedFactor(smX, bounds.xMin, bounds.xMax);
+    yFactor = calibratedFactor(smY, bounds.yMin, bounds.yMax);
+  } else {
+    // Fallback: heuristic mapping with dead zone + moderate amplification.
+    xFactor = shape(deadband(smX, TUNE.deadZone), TUNE.gainX);
+    yFactor = shape(deadband(smY, TUNE.deadZone), TUNE.gainY);
+  }
+
+  // Project into the product-grid bounding box (not the full viewport).
   const grid = productGridBounds();
   if (grid) {
     const x = grid.left + grid.width * (0.5 + xFactor * 0.5);
