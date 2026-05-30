@@ -31,16 +31,25 @@ export function gazeToViewportPoint(sig: FaceSignals) {
     return { x: window.innerWidth / 2, y: window.innerHeight / 2 };
   }
 
+  // The user wants to look right and have the dot go right, without moving
+  // their head. So we amplify the iris signal to cover the full viewport range.
+  //
+  // Comfortable eye movement (no head turn) gives iris values around ±0.3.
+  // We multiply by ~3x so that reaches ±0.9 (near the edges).
+  //
+  // Head pose (yaw/pitch) is used as a secondary fine-tuner, not the primary
+  // driver. This way the user can control the dot with their eyes alone.
   const gazeFlip = -sig.gazeX;
-  const yawNorm = clamp(sig.yaw / 35, -1, 1);
+  const irisNorm = clamp(gazeFlip * 3, -1, 1);
+  const yawNorm = -clamp(sig.yaw / 40, -1, 1);
 
-  // 55% iris + 45% head pose. Iris gives precision, head gives range.
-  const xFactor = clamp(gazeFlip * 0.55 + yawNorm * 0.45, -1, 1);
-  const yFactor = clamp(
-    sig.gazeY * 0.7 + clamp(sig.pitch / 25, -1, 1) * 0.3,
-    -1,
-    1,
-  );
+  // 80% iris + 20% head pose
+  const xFactor = clamp(irisNorm * 0.8 + yawNorm * 0.2, -1, 1);
+
+  // Same for vertical: amplify iris, keep pitch as fine-tuner
+  const irisYNorm = clamp(sig.gazeY * 3, -1, 1);
+  const pitchNorm = -clamp(sig.pitch / 30, -1, 1);
+  const yFactor = clamp(irisYNorm * 0.8 + pitchNorm * 0.2, -1, 1);
 
   // Map the [-1,1] factors into the actual product grid bounding box so the
   // dot and nearest-card matching only consider real product positions.
