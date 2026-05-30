@@ -204,7 +204,7 @@ export function EngagementTracker() {
                   <ProductImage product={lookedProduct} className="h-16 w-full" />
                   <div className="p-2">
                     <p className="text-[9px] uppercase tracking-wide text-violet-300">
-                      {gazeTarget.confidence > 85 ? "Screen target" : "Nearest card"} · {gazeTarget.confidence}%
+                      Gaze target · {gazeTarget.confidence}%
                     </p>
                     <p className="truncate text-[11px] font-semibold text-white">
                       {lookedProduct.name}
