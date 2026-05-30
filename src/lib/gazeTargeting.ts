@@ -1,6 +1,5 @@
 import { PRODUCTS, type Product } from "../data/products";
 import type { FaceSignals } from "./faceMesh";
-import { loadCalibration, calibrationBounds, calibratedFactor } from "./calibration";
 
 export interface GazeTarget {
   product: Product;
@@ -10,33 +9,81 @@ export interface GazeTarget {
   point: { x: number; y: number };
 }
 
-const PRODUCT_BY_ID = new Map(PRODUCTS.map((p) => [p.id, p]));
+export type CalibrationTarget = "left" | "center" | "right" | "top" | "bottom";
 
-// =====================================================================
-// CALIBRATION CONSTANTS — change these to dial in feel without rewriting.
-// =====================================================================
+export interface CalibrationProfile {
+  left: number;
+  centerX: number;
+  right: number;
+  top: number;
+  centerY: number;
+  bottom: number;
+}
+
+export interface CalibrationSamples {
+  leftX: number[];
+  centerX: number[];
+  rightX: number[];
+  topY: number[];
+  centerY: number[];
+  bottomY: number[];
+}
+
+const PRODUCT_BY_ID = new Map(PRODUCTS.map((p) => [p.id, p]));
+const CALIBRATION_KEY = "auraai_gaze_calibration_v1";
+
 const TUNE = {
-  // Sign per axis. Flip these if a direction is reversed for you.
-  signX: -1,        // -1 because the webcam preview is CSS-mirrored
+  signX: -1,          // mirrored camera preview
   signY: +1,
-  // Iris values below this magnitude are zeroed (treated as center gaze).
-  // Kept small so comfortable eye motion is preserved.
-  deadZone: 0.04,
-  // How aggressively to map iris values to screen space. Higher = reaches
-  // edges with smaller eye movement. Increase these two if you still have
-  // to look at the computer's edges to reach side products.
-  gainX: 4.2,
-  gainY: 3.8,
-  // EMA smoothing. 0..1 — higher = smoother but laggier.
+  deadZone: 0.015,    // much smaller now that calibration is user-specific
   smooth: 0.82,
-  // Sticky target: once a product is selected, it stays selected unless
-  // the new candidate is meaningfully closer (in pixels). Stops flicker.
-  stickinessPx: 90,
-  // Maximum projected distance from a product card before we hide the popup.
+  stickinessPx: 80,
   maxLockPx: 220,
-  // How many consecutive frames a new candidate must win before we switch.
-  switchFrames: 5,
+  switchFrames: 4,
 };
+
+let calibration: CalibrationProfile | null = loadCalibration();
+let smX = 0;
+let smY = 0;
+let lockedId: string | null = null;
+let lockedDist = Infinity;
+let challenger: string | null = null;
+let challengerFrames = 0;
+
+export function getCalibrationProfile() {
+  return calibration;
+}
+
+export function setCalibrationProfile(profile: CalibrationProfile) {
+  calibration = profile;
+  try {
+    localStorage.setItem(CALIBRATION_KEY, JSON.stringify(profile));
+  } catch {
+    /* ignore */
+  }
+  resetGazeSmoothing();
+}
+
+export function clearCalibrationProfile() {
+  calibration = null;
+  try {
+    localStorage.removeItem(CALIBRATION_KEY);
+  } catch {
+    /* ignore */
+  }
+  resetGazeSmoothing();
+}
+
+export function buildCalibrationProfile(samples: CalibrationSamples): CalibrationProfile {
+  return {
+    left: avg(samples.leftX),
+    centerX: avg(samples.centerX),
+    right: avg(samples.rightX),
+    top: avg(samples.topY),
+    centerY: avg(samples.centerY),
+    bottom: avg(samples.bottomY),
+  };
+}
 
 // ---------- Product grid bounding box ----------
 function productGridBounds(): { left: number; top: number; width: number; height: number } | null {
@@ -58,50 +105,52 @@ function productGridBounds(): { left: number; top: number; width: number; height
   return { left: minL, top: minT, width: maxR - minL, height: maxB - minT };
 }
 
-// ---------- Signal smoothing ----------
-let smX = 0;
-let smY = 0;
-
 function deadband(v: number, dz: number) {
-  // Simple threshold — zero out tiny values but don't rescale. Rescaling
-  // shrinks the usable iris range, which is exactly why the dot couldn't
-  // reach the edges.
-  if (Math.abs(v) < dz) return 0;
-  return v;
+  if (v > dz) return (v - dz) / (1 - dz);
+  if (v < -dz) return (v + dz) / (1 - dz);
+  return 0;
 }
 
-function shape(v: number, gain: number) {
-  // Tanh keeps the response smooth and bounded. Moderate gain so we don't
-  // snap to the corner from any small eye motion.
-  return Math.tanh(v * gain);
+function ease(v: number) {
+  // Smooth but less aggressive than tanh-gain guessing. Calibration gives us
+  // range; this just softens the curve slightly near center.
+  return Math.tanh(v * 1.6);
 }
 
-// ---------- Gaze projection ----------
-export function gazeToViewportPoint(sig: FaceSignals) {
-  // Apply per-axis sign (webcam is CSS-mirrored, so negate X).
+function normalizePiecewise(v: number, neg: number, center: number, pos: number) {
+  // Maps measured raw gaze values to -1..1 using the user's own calibration
+  // anchors. Piecewise interpolation gives much better control than a single
+  // global gain constant.
+  if (v <= center) {
+    const denom = center - neg || 1e-6;
+    return -clamp((center - v) / denom, 0, 1);
+  }
+  const denom = pos - center || 1e-6;
+  return clamp((v - center) / denom, 0, 1);
+}
+
+function calibratedFactors(sig: FaceSignals) {
   const rawX = TUNE.signX * sig.gazeX;
   const rawY = TUNE.signY * sig.gazeY;
 
-  // EMA smoothing to reduce jitter.
   smX = smX * TUNE.smooth + rawX * (1 - TUNE.smooth);
   smY = smY * TUNE.smooth + rawY * (1 - TUNE.smooth);
 
-  let xFactor: number;
-  let yFactor: number;
-
-  const cal = loadCalibration();
-  if (cal) {
-    // Calibrated path: use per-user iris bounds learned from 9-point setup.
-    const bounds = calibrationBounds(cal);
-    xFactor = calibratedFactor(smX, bounds.xMin, bounds.xMax);
-    yFactor = calibratedFactor(smY, bounds.yMin, bounds.yMax);
-  } else {
-    // Fallback: heuristic mapping with dead zone + moderate amplification.
-    xFactor = shape(deadband(smX, TUNE.deadZone), TUNE.gainX);
-    yFactor = shape(deadband(smY, TUNE.deadZone), TUNE.gainY);
+  if (calibration) {
+    const x = ease(deadband(normalizePiecewise(smX, calibration.left, calibration.centerX, calibration.right), TUNE.deadZone));
+    const y = ease(deadband(normalizePiecewise(smY, calibration.top, calibration.centerY, calibration.bottom), TUNE.deadZone));
+    return { xFactor: x, yFactor: y };
   }
 
-  // Project into the product-grid bounding box (not the full viewport).
+  // Fallback if user hasn't calibrated yet.
+  return {
+    xFactor: ease(deadband(smX * 2.8, TUNE.deadZone)),
+    yFactor: ease(deadband(smY * 2.2, TUNE.deadZone)),
+  };
+}
+
+export function gazeToViewportPoint(sig: FaceSignals) {
+  const { xFactor, yFactor } = calibratedFactors(sig);
   const grid = productGridBounds();
   if (grid) {
     const x = grid.left + grid.width * (0.5 + xFactor * 0.5);
@@ -128,23 +177,18 @@ export function resetGazeSmoothing() {
   challengerFrames = 0;
 }
 
-// ---------- Target lock (anti-flicker) ----------
-let lockedId: string | null = null;
-let lockedDist = Infinity;
-let challenger: string | null = null;
-let challengerFrames = 0;
-
 interface RawCandidate { id: string; product: Product; rect: DOMRect; distance: number; }
 
 export function findVisibleGazeTarget(sig: FaceSignals): GazeTarget | null {
   if (!sig.present) {
-    challenger = null; challengerFrames = 0;
+    challenger = null;
+    challengerFrames = 0;
     return null;
   }
   const point = gazeToViewportPoint(sig);
-
   const nodes = Array.from(document.querySelectorAll<HTMLElement>("[data-aura-product-id]"));
   const candidates: RawCandidate[] = [];
+
   for (const node of nodes) {
     const id = node.dataset.auraProductId;
     const product = id ? PRODUCT_BY_ID.get(id) : undefined;
@@ -156,24 +200,19 @@ export function findVisibleGazeTarget(sig: FaceSignals): GazeTarget | null {
     candidates.push({ id, product, rect, distance: Math.hypot(dx, dy) });
   }
 
-  if (candidates.length === 0) return null;
+  if (!candidates.length) return null;
   candidates.sort((a, b) => a.distance - b.distance);
   const closest = candidates[0];
 
-  // First-time lock
   if (lockedId === null) {
     lockedId = closest.id;
     lockedDist = closest.distance;
   } else {
-    // Update distance to currently-locked product
     const lockedNow = candidates.find((c) => c.id === lockedId);
     lockedDist = lockedNow ? lockedNow.distance : Infinity;
-
-    // Consider switching only if a different product is meaningfully closer
     if (closest.id !== lockedId && lockedDist - closest.distance > TUNE.stickinessPx) {
-      if (challenger === closest.id) {
-        challengerFrames += 1;
-      } else {
+      if (challenger === closest.id) challengerFrames += 1;
+      else {
         challenger = closest.id;
         challengerFrames = 1;
       }
@@ -204,12 +243,29 @@ export function quickLookReview(target: GazeTarget): string {
   return `Closest visible product is ${product.name}.`;
 }
 
-// ---------- helpers ----------
+function loadCalibration(): CalibrationProfile | null {
+  try {
+    const raw = localStorage.getItem(CALIBRATION_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw) as CalibrationProfile;
+  } catch {
+    return null;
+  }
+}
+
+function avg(values: number[]) {
+  if (!values.length) return 0;
+  return values.reduce((s, v) => s + v, 0) / values.length;
+}
+
 function isVisible(rect: DOMRect) {
   return (
-    rect.width > 24 && rect.height > 24 &&
-    rect.bottom > 0 && rect.right > 0 &&
-    rect.top < window.innerHeight && rect.left < window.innerWidth
+    rect.width > 24 &&
+    rect.height > 24 &&
+    rect.bottom > 0 &&
+    rect.right > 0 &&
+    rect.top < window.innerHeight &&
+    rect.left < window.innerWidth
   );
 }
 
