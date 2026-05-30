@@ -45,6 +45,7 @@ export function Recommendations({
               exit={{ opacity: 0, scale: 0.95 }}
               whileHover={{ y: -4 }}
               onClick={() => onOpen(r.product)}
+              data-aura-product-id={r.product.id}
               className="group aura-glass overflow-hidden rounded-2xl text-left"
             >
               <div className="relative">
