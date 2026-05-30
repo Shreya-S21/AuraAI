@@ -34,6 +34,7 @@ export function ProductCard({
       onMouseLeave={() => {
         if (hoverStart) recordDwell(product.id, Date.now() - hoverStart);
       }}
+      data-aura-product-id={product.id}
       className="group cursor-pointer"
       onClick={() => onOpen(product)}
     >
