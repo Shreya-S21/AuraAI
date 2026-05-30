@@ -1,24 +1,31 @@
 // =============================================================
 // EngagementTracker — REAL webcam capture + MediaPipe FaceLandmarker.
 // -------------------------------------------------------------
-// Runs Google's actual 468-point face mesh (WASM) in the browser to
-// derive measured signals: presence, head pose (yaw/pitch/roll),
-// iris-based gaze, blink, and a "looking at screen" flag.
-//
-// BEHAVIORAL ENGAGEMENT analysis — NOT emotion detection. Frames are
-// processed entirely on-device; only numeric signals are kept.
+// Now includes a 5-point calibration flow so gaze mapping learns the
+// current user's eyes instead of relying only on guessed constants.
 // =============================================================
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Camera, CameraOff, Activity, ScanFace, Shield, Eye, Loader2, Target } from "lucide-react";
+import {
+  Camera, CameraOff, Activity, ScanFace, Shield, Eye, Loader2,
+  Target, RotateCcw,
+} from "lucide-react";
 import { Button, Card } from "./ui";
 import { useSession } from "../context/SessionContext";
 import { ProductImage } from "./ProductImage";
-import { findVisibleGazeTarget, gazeToViewportPoint, quickLookReview, type GazeTarget } from "../lib/gazeTargeting";
-import { writeLiveGaze } from "../lib/liveGaze";
-import { loadCalibration } from "../lib/calibration";
-import { CalibrationOverlay } from "./CalibrationOverlay";
+import {
+  findVisibleGazeTarget,
+  gazeToViewportPoint,
+  quickLookReview,
+  type GazeTarget,
+  buildCalibrationProfile,
+  setCalibrationProfile,
+  getCalibrationProfile,
+  clearCalibrationProfile,
+  resetGazeSmoothing,
+  type CalibrationSamples,
+} from "../lib/gazeTargeting";
 import {
   loadFaceLandmarker,
   analyzeFrame,
@@ -26,19 +33,37 @@ import {
   type FaceSignals,
 } from "../lib/faceMesh";
 
+const STEPS = [
+  { key: "center", label: "Look at the center dot", x: "50%", y: "50%" },
+  { key: "left", label: "Now look at the left dot", x: "12%", y: "50%" },
+  { key: "right", label: "Now look at the right dot", x: "88%", y: "50%" },
+  { key: "top", label: "Now look at the top dot", x: "50%", y: "14%" },
+  { key: "bottom", label: "Now look at the bottom dot", x: "50%", y: "86%" },
+] as const;
+
+type StepKey = (typeof STEPS)[number]["key"];
+
+function emptySamples(): CalibrationSamples {
+  return { leftX: [], centerX: [], rightX: [], topY: [], centerY: [], bottomY: [] };
+}
+
 export function EngagementTracker() {
   const { cameraActive, setCameraActive, attention, setAttention } = useSession();
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const rafRef = useRef<number>(0);
   const attentionSmooth = useRef(0);
+  const rollingX = useRef<number[]>([]);
+  const rollingY = useRef<number[]>([]);
+  const collected = useRef<CalibrationSamples>(emptySamples());
 
   const [error, setError] = useState<string | null>(null);
   const [loadingModel, setLoadingModel] = useState(false);
   const [sig, setSig] = useState<FaceSignals | null>(null);
   const [gazeTarget, setGazeTarget] = useState<GazeTarget | null>(null);
   const [calibrating, setCalibrating] = useState(false);
-  const hasCalibration = !!loadCalibration();
+  const [stepIndex, setStepIndex] = useState(0);
+  const [hasCalibration, setHasCalibration] = useState(!!getCalibrationProfile());
 
   const stop = useCallback(() => {
     cancelAnimationFrame(rafRef.current);
@@ -48,7 +73,9 @@ export function EngagementTracker() {
     setAttention(0);
     setSig(null);
     setGazeTarget(null);
+    setCalibrating(false);
     attentionSmooth.current = 0;
+    resetGazeSmoothing();
   }, [setCameraActive, setAttention]);
 
   const loop = useCallback(() => {
@@ -60,16 +87,16 @@ export function EngagementTracker() {
     const s = analyzeFrame(video, performance.now());
     setSig(s);
     setGazeTarget(findVisibleGazeTarget(s));
-    // Smooth published attention (EMA) so scoring isn't jittery.
+
+    if (s.present) {
+      rollingX.current.push(s.gazeX);
+      rollingY.current.push(s.gazeY);
+      if (rollingX.current.length > 18) rollingX.current.shift();
+      if (rollingY.current.length > 18) rollingY.current.shift();
+    }
+
     attentionSmooth.current = +(attentionSmooth.current * 0.82 + s.attention * 0.18).toFixed(3);
     setAttention(attentionSmooth.current);
-    // Publish raw gaze to shared store so CalibrationOverlay can sample it.
-    writeLiveGaze({
-      gazeX: s.gazeX,
-      gazeY: s.gazeY,
-      present: s.present,
-      attention: s.attention,
-    });
     rafRef.current = requestAnimationFrame(loop);
   }, [setAttention]);
 
@@ -77,9 +104,7 @@ export function EngagementTracker() {
     setError(null);
     setLoadingModel(true);
     try {
-      // 1) Load the real MediaPipe model (cached after first load).
       await loadFaceLandmarker();
-      // 2) Get the camera.
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { width: 640, height: 480, facingMode: "user" },
         audio: false,
@@ -102,6 +127,57 @@ export function EngagementTracker() {
     }
   }, [loop, setCameraActive]);
 
+  const beginCalibration = useCallback(() => {
+    if (!cameraActive) return;
+    collected.current = emptySamples();
+    rollingX.current = [];
+    rollingY.current = [];
+    resetGazeSmoothing();
+    setStepIndex(0);
+    setCalibrating(true);
+  }, [cameraActive]);
+
+  const captureCalibrationStep = useCallback(() => {
+    if (!sig?.present) return;
+    const xs = [...rollingX.current];
+    const ys = [...rollingY.current];
+    if (xs.length < 6 || ys.length < 6) return;
+
+    const step = STEPS[stepIndex].key as StepKey;
+    if (step === "center") {
+      collected.current.centerX = xs;
+      collected.current.centerY = ys;
+    } else if (step === "left") {
+      collected.current.leftX = xs;
+    } else if (step === "right") {
+      collected.current.rightX = xs;
+    } else if (step === "top") {
+      collected.current.topY = ys;
+    } else if (step === "bottom") {
+      collected.current.bottomY = ys;
+    }
+
+    if (stepIndex === STEPS.length - 1) {
+      const profile = buildCalibrationProfile(collected.current);
+      setCalibrationProfile(profile);
+      setHasCalibration(true);
+      setCalibrating(false);
+      setStepIndex(0);
+      return;
+    }
+
+    rollingX.current = [];
+    rollingY.current = [];
+    setStepIndex((s) => s + 1);
+  }, [sig, stepIndex]);
+
+  const resetCalibration = useCallback(() => {
+    clearCalibrationProfile();
+    setHasCalibration(false);
+    setCalibrating(false);
+    setStepIndex(0);
+  }, []);
+
   useEffect(() => {
     return () => {
       cancelAnimationFrame(rafRef.current);
@@ -116,10 +192,11 @@ export function EngagementTracker() {
   const lookedProduct = gazeTarget?.product ?? null;
   const gazePoint = sig?.present ? gazeToViewportPoint(sig) : null;
   const popupPlacement = box ? facePopupPlacement(box) : null;
+  const currentStep = STEPS[stepIndex];
+  const canCapture = present && rollingX.current.length >= 6 && rollingY.current.length >= 6;
 
   return (
-    <>
-      <Card className="overflow-hidden">
+    <Card className="overflow-hidden">
       <div className="flex items-center justify-between border-b border-white/5 p-4">
         <div className="flex items-center gap-2">
           <ScanFace className="h-5 w-5 text-violet-400" />
@@ -168,7 +245,6 @@ export function EngagementTracker() {
           <>
             <AnimatePresence>
               {present && box && (
-                // Real landmark bounding box. Video is mirrored, so flip x.
                 <motion.div
                   initial={{ opacity: 0 }}
                   animate={{ opacity: 1 }}
@@ -195,7 +271,8 @@ export function EngagementTracker() {
                   </span>
                 </motion.div>
               )}
-              {present && box && gazePoint && (
+
+              {present && box && gazePoint && !calibrating && (
                 <motion.div
                   initial={{ opacity: 0 }}
                   animate={{ opacity: 1 }}
@@ -204,7 +281,8 @@ export function EngagementTracker() {
                   style={{ left: gazePoint.x, top: gazePoint.y }}
                 />
               )}
-              {present && box && lookedProduct && popupPlacement && gazeTarget && (
+
+              {present && box && lookedProduct && popupPlacement && gazeTarget && !calibrating && (
                 <motion.div
                   key={lookedProduct.id}
                   initial={{ opacity: 0, y: 8, scale: 0.95 }}
@@ -219,15 +297,43 @@ export function EngagementTracker() {
                     <p className="text-[9px] uppercase tracking-wide text-violet-300">
                       {gazeTarget.confidence > 85 ? "Screen target" : "Nearest card"} · {gazeTarget.confidence}%
                     </p>
-                    <p className="truncate text-[11px] font-semibold text-white">
-                      {lookedProduct.name}
-                    </p>
+                    <p className="truncate text-[11px] font-semibold text-white">{lookedProduct.name}</p>
                     <p className="mt-1 line-clamp-2 text-[10px] leading-snug text-zinc-400">
                       {quickLookReview(gazeTarget)}
                     </p>
                   </div>
                 </motion.div>
               )}
+
+              {calibrating && (
+                <motion.div
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  exit={{ opacity: 0 }}
+                  className="absolute inset-0 z-[60] bg-black/55 backdrop-blur-sm"
+                >
+                  {STEPS.map((s, i) => (
+                    <div
+                      key={s.key}
+                      className={`absolute -translate-x-1/2 -translate-y-1/2 rounded-full ${
+                        i === stepIndex ? "h-6 w-6 bg-sky-400 shadow-lg shadow-sky-400/40" : "h-3 w-3 bg-white/30"
+                      }`}
+                      style={{ left: s.x, top: s.y }}
+                    />
+                  ))}
+                  <div className="absolute inset-x-4 bottom-4 rounded-2xl border border-white/10 bg-black/70 p-4 text-center backdrop-blur">
+                    <p className="text-sm font-semibold text-white">Calibration step {stepIndex + 1} / {STEPS.length}</p>
+                    <p className="mt-1 text-xs text-zinc-400">{currentStep.label}. Keep your head still and move only your eyes.</p>
+                    <div className="mt-3 flex justify-center gap-2">
+                      <Button variant="outline" onClick={() => setCalibrating(false)}>Cancel</Button>
+                      <Button onClick={captureCalibrationStep} disabled={!canCapture}>
+                        <Target className="h-4 w-4" /> Capture
+                      </Button>
+                    </div>
+                  </div>
+                </motion.div>
+              )}
+
               {!present && (
                 <motion.div
                   initial={{ opacity: 0 }}
@@ -239,17 +345,13 @@ export function EngagementTracker() {
                 </motion.div>
               )}
             </AnimatePresence>
-            <div className="absolute right-3 top-3 rounded-lg bg-black/50 px-2 py-1 text-[10px] text-emerald-300 backdrop-blur">
-              ● REC
-            </div>
-            <div className="absolute left-3 top-3 rounded-lg bg-black/50 px-2 py-1 text-[9px] font-medium text-zinc-300 backdrop-blur">
-              MediaPipe FaceMesh
-            </div>
+
+            <div className="absolute right-3 top-3 rounded-lg bg-black/50 px-2 py-1 text-[10px] text-emerald-300 backdrop-blur">● REC</div>
+            <div className="absolute left-3 top-3 rounded-lg bg-black/50 px-2 py-1 text-[9px] font-medium text-zinc-300 backdrop-blur">MediaPipe FaceMesh</div>
           </>
         )}
       </div>
 
-      {/* Live measured signals */}
       <div className="grid grid-cols-4 divide-x divide-white/5 border-t border-white/5">
         <Signal label="Attention" value={`${attPct}%`} icon={<Activity className="h-3.5 w-3.5" />} />
         <Signal label="Gaze" value={present ? gazeLabel(sig!) : "—"} icon={<Eye className="h-3.5 w-3.5" />} />
@@ -265,39 +367,35 @@ export function EngagementTracker() {
             transition={{ duration: 0.4 }}
           />
         </div>
-        <div className="flex items-center justify-between">
+        <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
           <span className="flex items-center gap-1 text-[10px] text-zinc-500">
             <Shield className="h-3 w-3" /> On-device · no emotion data · no frames stored
           </span>
-          <div className="flex items-center gap-1">
+          <div className="flex gap-2">
             {cameraActive && (
-              <>
-                <Button
-                  variant="ghost"
-                  className="px-2 py-1 text-xs"
-                  onClick={() => setCalibrating(true)}
-                  title={hasCalibration ? "Recalibrate gaze" : "Calibrate gaze for better accuracy"}
-                >
-                  <Target className="h-3.5 w-3.5" />
-                  <span className="ml-1 hidden sm:inline">{hasCalibration ? "Recalibrate" : "Calibrate"}</span>
-                </Button>
-                <Button variant="ghost" className="px-2 py-1 text-xs" onClick={stop}>
-                  <CameraOff className="h-3.5 w-3.5" /> Stop
-                </Button>
-              </>
+              <Button variant="outline" className="px-2 py-1 text-xs" onClick={beginCalibration}>
+                <Target className="h-3.5 w-3.5" /> {hasCalibration ? "Recalibrate" : "Calibrate"}
+              </Button>
+            )}
+            {hasCalibration && (
+              <Button variant="ghost" className="px-2 py-1 text-xs" onClick={resetCalibration}>
+                <RotateCcw className="h-3.5 w-3.5" /> Reset
+              </Button>
+            )}
+            {cameraActive && (
+              <Button variant="ghost" className="px-2 py-1 text-xs" onClick={stop}>
+                <CameraOff className="h-3.5 w-3.5" /> Stop
+              </Button>
             )}
           </div>
         </div>
+        <p className="text-[10px] text-zinc-500">
+          {hasCalibration
+            ? "Gaze calibration saved for this browser. Recalibrate if lighting or camera angle changes."
+            : "Run calibration for more accurate left/right product targeting."}
+        </p>
       </div>
     </Card>
-
-    {calibrating && (
-      <CalibrationOverlay
-        onDone={() => setCalibrating(false)}
-        onCancel={() => setCalibrating(false)}
-      />
-    )}
-  </>
   );
 }
 
@@ -318,15 +416,7 @@ function facePopupPlacement(box: { x: number; y: number; w: number; h: number })
   return { left: `${left}%`, top: `${top}%` };
 }
 
-function Signal({
-  label,
-  value,
-  icon,
-}: {
-  label: string;
-  value: string;
-  icon: React.ReactNode;
-}) {
+function Signal({ label, value, icon }: { label: string; value: string; icon: React.ReactNode }) {
   return (
     <div className="flex flex-col items-center gap-1 py-3">
       <span className="flex items-center gap-1 text-[9px] uppercase tracking-wide text-zinc-500">
