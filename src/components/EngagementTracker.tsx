@@ -15,8 +15,8 @@ import { Camera, CameraOff, Activity, ScanFace, Shield, Eye, Loader2 } from "luc
 import { Button, Card } from "./ui";
 import { useSession } from "../context/SessionContext";
 import { ProductImage } from "./ProductImage";
-import { PRODUCTS } from "../data/products";
-import { recommend } from "../lib/engagement";
+import { PRODUCTS, type Product } from "../data/products";
+import { recommend, type EngagementState } from "../lib/engagement";
 import {
   loadFaceLandmarker,
   analyzeFrame,
@@ -100,8 +100,7 @@ export function EngagementTracker() {
   const present = !!sig?.present;
   const box = sig?.box ?? null;
   const gazeCandidates = useMemo(() => {
-    const personalized = recommend(state, 4).map((r) => r.product);
-    return personalized.length ? personalized : PRODUCTS.slice(0, 4);
+    return buildGazeCandidates(state);
   }, [state]);
   const lookedProduct = present && sig ? pickLookTarget(sig, gazeCandidates) : null;
   const popupPlacement = box ? facePopupPlacement(box) : null;
@@ -263,15 +262,42 @@ function gazeLabel(s: FaceSignals): string {
   return [v, h].filter(Boolean).join("-") || "Center";
 }
 
+function buildGazeCandidates(state: EngagementState): Product[] {
+  const seen = new Set<string>();
+  const out: Product[] = [];
+  const add = (p: Product | undefined) => {
+    if (!p || seen.has(p.id)) return;
+    seen.add(p.id);
+    out.push(p);
+  };
+
+  // 1) Personalized recommendations first.
+  recommend(state, 8).forEach((r) => add(r.product));
+
+  // 2) Add saved and viewed products so the camera popup reflects the user's session.
+  PRODUCTS.filter((p) => state.liked[p.id]).forEach(add);
+  PRODUCTS
+    .filter((p) => (state.signals[p.id]?.views ?? 0) > 0)
+    .sort((a, b) => (state.signals[b.id]?.dwellMs ?? 0) - (state.signals[a.id]?.dwellMs ?? 0))
+    .forEach(add);
+
+  // 3) Fill with diverse category representatives, not just the first catalog items.
+  for (const p of PRODUCTS) {
+    if (!out.some((x) => x.category === p.category)) add(p);
+  }
+  PRODUCTS.forEach(add);
+
+  return out.slice(0, 9);
+}
+
 function pickLookTarget<T>(s: FaceSignals, products: T[]): T | null {
   if (!products.length) return null;
-  // Map measured gaze direction to a stable quadrant. This does not claim
-  // exact eye-tracking on the product grid; it uses gaze geometry to choose
-  // the product area the user appears to be attending to in this demo.
-  if (Math.abs(s.gazeX) < 0.25 && Math.abs(s.gazeY) < 0.3) return products[0];
-  if (s.gazeX > 0.25) return products[1 % products.length];
-  if (s.gazeX < -0.25) return products[2 % products.length];
-  return products[3 % products.length];
+  // Map measured gaze into a 3x3 attention grid so different gaze zones
+  // resolve to different products. Deterministic, not randomized.
+  const xBin = s.gazeX < -0.18 ? 0 : s.gazeX > 0.18 ? 2 : 1;
+  const yBin = s.gazeY < -0.22 ? 0 : s.gazeY > 0.22 ? 2 : 1;
+  const index = yBin * 3 + xBin;
+  return products[index % products.length];
 }
 
 function facePopupPlacement(box: { x: number; y: number; w: number; h: number }) {
